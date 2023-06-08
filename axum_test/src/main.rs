@@ -1,70 +1,74 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+mod handle;
 
 use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc::UnboundedSender, oneshot::Sender};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct User {
+pub(crate) struct User {
     name: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Method {
+    Create,
+    Query,
+    Del,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Body {
+    user: User,
+    method: Method,
+}
+#[derive(Debug)]
+pub(crate) struct SenderBody {
+    user: User,
+    method: Method,
+    sender: Sender<Reponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) enum Reponse {
+    Ok,
+    Err(String),
+    User(User),
 }
 
 #[tokio::main]
 async fn main() {
-    let mut user_map: HashMap<String, User> = HashMap::new();
+    let (collect_tx, collect_rx) = tokio::sync::mpsc::unbounded_channel::<SenderBody>();
+    let collect_rx = tokio_stream::wrappers::UnboundedReceiverStream::new(collect_rx);
+
+    tokio::spawn(async move { handle::handle(collect_rx).await });
 
     let app = Router::new()
-        .route("/", get(root))
-        .route("/create", post(create_user))
-        .route("/query", post(query_user))
-        .route("/del", post(del_user))
-        .layer(Extension(Arc::new(RwLock::new(user_map))));
+        .route("/", post(root))
+        .layer(Extension(collect_tx.clone()));
 
-    // run it with hyper on localhost:3000
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();
 }
 
-// which calls one of these handlers
-async fn root() -> &'static str {
-    "Hello, World!"
-}
-
-async fn create_user(
-    Extension(state): Extension<Arc<RwLock<HashMap<String, User>>>>,
-    user: Json<User>,
-) -> Json<User> {
-    let mut data = state.write().unwrap();
-    data.insert(user.name.clone(), user.0.clone());
-    println!("Received user: {:?}", user.name);
-    println!("{:#?}", data);
-    user
-}
-
-async fn query_user(
-    Extension(state): Extension<Arc<RwLock<HashMap<String, User>>>>,
-    user: Json<User>,
-) -> Json<Option<User>> {
-    let data = state.read().unwrap();
-    let res = data.get(&user.name).cloned();
-    Json(res)
-}
-
-async fn del_user(
-    Extension(state): Extension<Arc<RwLock<HashMap<String, User>>>>,
-    user: Json<User>,
-) -> String {
-    let mut data = state.write().unwrap();
-    let res = match data.remove(&user.name) {
-        Some(_) => "ok",
-        None => "不存在该用户",
-    };
-    res.to_string()
+async fn root(
+    Extension(collect_tx): Extension<UnboundedSender<SenderBody>>,
+    Json(params): Json<Body>,
+) -> Json<Reponse> {
+    let (sender, recv) = tokio::sync::oneshot::channel::<Reponse>();
+    collect_tx
+        .send(SenderBody {
+            sender,
+            user: params.user,
+            method: params.method,
+        })
+        .unwrap();
+    match recv.await {
+        Ok(res) => Json(res),
+        Err(_) => Json(Reponse::Err("出错了".to_string())),
+    }
 }
